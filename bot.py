@@ -63,9 +63,16 @@ STATUS_LABELS = {
     "waitlist": "🟠 в листе ожидания",
 }
 
+VOICE_LABELS = {
+    "": "—",
+    "awaiting": "🎙 ждём голосовое",
+    "received": "🎧 голосовое прислано",
+}
+
 
 class Booking(StatesGroup):
     waiting_date = State()
+    waiting_voice = State()
 
 
 class EditingText(StatesGroup):
@@ -218,11 +225,17 @@ async def chose_date(callback: CallbackQuery, state: FSMContext) -> None:
         full_name=full_name,
         contact=contact,
         status="booked",
+        voice_status="awaiting",
         stall_prompted=0,
     )
     client = await db.get_client(callback.from_user.id)
     await db.create_booking(client["id"], date_iso, time_hm)
-    await state.clear()
+
+    # Ждём от ученицы голосовое для диагностики уровня
+    await state.set_state(Booking.waiting_voice)
+    await state.update_data(
+        level_display=level_display, booking_when=_fmt_dt(date_iso, time_hm)
+    )
 
     when = _fmt_dt(date_iso, time_hm)
     confirm_text = await texts.get_text("booking_confirmed", when=when)
@@ -234,6 +247,9 @@ async def chose_date(callback: CallbackQuery, state: FSMContext) -> None:
         )
     else:
         await callback.message.answer(confirm_text)
+
+    # Просьба записать голосовое — отдельным сообщением, чтобы не терялась
+    await callback.message.answer(await texts.get_text("voice_request"))
 
     spots_left = config.CAPACITY_PER_SLOT - count - 1
     await notify_admin(
@@ -248,6 +264,77 @@ async def chose_date(callback: CallbackQuery, state: FSMContext) -> None:
         ),
     )
     await callback.answer()
+
+
+# ------------------------------------- голосовое для диагностики уровня ----
+
+@router.message(Booking.waiting_voice, F.voice | F.audio | F.video_note)
+async def got_voice(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    level_display = data.get("level_display", "—")
+    when = data.get("booking_when", "—")
+
+    client = await db.get_client(message.from_user.id)
+    await db.update_client(message.from_user.id, voice_status="received", stall_prompted=0)
+
+    await message.answer(await texts.get_text("voice_received"))
+    await state.clear()
+
+    # Пересылаем аудио преподавателю вместе с карточкой ученицы
+    if config.ADMIN_CHAT_ID:
+        name = (client or {}).get("full_name") or message.from_user.full_name
+        contact = (client or {}).get("contact") or f"@{message.from_user.username or '—'}"
+        try:
+            await message.bot.send_message(
+                config.ADMIN_CHAT_ID,
+                (
+                    "🎧 Голосовое для диагностики уровня\n"
+                    f"Имя: {name}\n"
+                    f"Заявленный уровень: {level_display}\n"
+                    f"Урок: {when}\n"
+                    f"Telegram: {contact} (id {message.from_user.id})"
+                ),
+            )
+            await message.forward(config.ADMIN_CHAT_ID)
+        except Exception:
+            log.exception("Не удалось переслать голосовое админу")
+
+
+@router.message(Booking.waiting_voice, ~F.text.startswith("/"))
+async def voice_expected(message: Message) -> None:
+    """Ученица прислала что-то не то (текст, стикер, фото) — мягко повторяем просьбу.
+    Команды (текст, начинающийся с "/") сюда не попадают — иначе на шаге ожидания
+    голосового перестали бы работать админ-команды вроде /leads и /texts."""
+    await db.touch_client(message.from_user.id)
+    await message.answer(await texts.get_text("voice_nudge"))
+
+
+@router.message(F.voice | F.audio | F.video_note)
+async def late_voice(message: Message) -> None:
+    """Голосовое пришло позже, вне шага записи (например, после напоминания
+    или уже после того, как ученица записалась ранее)."""
+    client = await db.get_client(message.from_user.id)
+    if not client:
+        return
+
+    await db.update_client(message.from_user.id, voice_status="received", stall_prompted=1)
+    await message.answer(await texts.get_text("voice_received"))
+
+    if config.ADMIN_CHAT_ID:
+        try:
+            await message.bot.send_message(
+                config.ADMIN_CHAT_ID,
+                (
+                    "🎧 Голосовое для диагностики уровня\n"
+                    f"Имя: {client.get('full_name') or message.from_user.full_name}\n"
+                    f"Заявленный уровень: {client.get('level') or '—'}\n"
+                    f"Telegram: {client.get('contact') or '@' + (message.from_user.username or '—')} "
+                    f"(id {message.from_user.id})"
+                ),
+            )
+            await message.forward(config.ADMIN_CHAT_ID)
+        except Exception:
+            log.exception("Не удалось переслать голосовое админу")
 
 
 # --------------------------------------------- «не нашли время» / лист ожидания --
@@ -378,6 +465,8 @@ async def cmd_leads(message: Message) -> None:
             line += f"\nУровень: {c['level']}"
         if c.get("booking_date"):
             line += f"\nЗаписан(а): {_fmt_dt(c['booking_date'], c['booking_time'])}"
+        if c.get("voice_status"):
+            line += f"\nГолосовое: {VOICE_LABELS.get(c['voice_status'], c['voice_status'])}"
         if c.get("contact"):
             line += f"\nКонтакт: {c['contact']}"
         line += f"\nTelegram: @{c['username'] or '—'}"
@@ -403,19 +492,75 @@ async def cmd_export(message: Message) -> None:
     writer = csv.DictWriter(
         buffer,
         fieldnames=[
-            "full_name", "level", "status", "contact", "username", "telegram_id",
-            "booking_date", "booking_time", "created_at", "last_activity",
+            "full_name", "level", "status", "voice_status", "contact", "username",
+            "telegram_id", "booking_date", "booking_time", "created_at", "last_activity",
         ],
     )
     writer.writeheader()
     for r in rows:
         r = dict(r)
         r["status"] = STATUS_LABELS.get(r["status"], r["status"])
+        r["voice_status"] = VOICE_LABELS.get(r.get("voice_status") or "", r.get("voice_status"))
         writer.writerow(r)
 
     csv_bytes = buffer.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel не ломал кириллицу
     document = BufferedInputFile(csv_bytes, filename="leads.csv")
     await message.answer_document(document, caption="Все заявки и контакты")
+
+
+# ------------------------------------------------------- очистка данных ----
+# /cancelme — удалить свои записи (после тестов)
+# /resetdata — полностью очистить все записи, заявки и лист ожидания
+
+@router.message(Command("cancelme"))
+async def cmd_cancelme(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    removed = await db.delete_bookings_of(message.from_user.id)
+    if removed:
+        await message.answer(f"Удалила ваши записи: {removed} шт. Места в группах освободились.")
+    else:
+        await message.answer("У вас нет записей — удалять нечего.")
+
+
+@router.message(Command("resetdata"))
+async def cmd_resetdata(message: Message) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗑 Да, удалить всё", callback_data="confirm_reset")
+    kb.button(text="Отмена", callback_data="cancel_reset")
+    kb.adjust(1)
+    await message.answer(
+        "Удалить ВСЕ записи, заявки и лист ожидания?\n\n"
+        "Это нужно, чтобы очистить тестовые данные перед запуском. "
+        "Отредактированные тексты (/texts) и расписание сохранятся.",
+        reply_markup=kb.as_markup(),
+    )
+
+
+@router.callback_query(F.data == "cancel_reset")
+async def cancel_reset(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.message.edit_text("Отменила, данные на месте.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "confirm_reset")
+async def confirm_reset(callback: CallbackQuery) -> None:
+    if not _is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    stats = await db.wipe_all_data()
+    await callback.message.edit_text(
+        "Готово, всё очищено ✅\n"
+        f"Записей удалено: {stats['bookings']}\n"
+        f"Карточек учениц: {stats['clients']}\n"
+        f"Заявок в листе ожидания: {stats['waitlist']}"
+    )
+    await callback.answer()
 
 
 # --------------------------------------------------- редактирование текстов --
@@ -521,6 +666,16 @@ async def check_stalled_clients(bot: Bot) -> None:
             await db.update_client(client["telegram_id"], stall_prompted=1)
         except Exception:
             log.exception("Не удалось написать клиенту %s", client["telegram_id"])
+
+    # Одно напоминание тем, кто записался, но не прислал голосовое
+    awaiting = await db.get_clients_awaiting_voice(threshold_utc)
+    for client in awaiting:
+        try:
+            text = await texts.get_text("voice_reminder")
+            await bot.send_message(client["telegram_id"], text)
+            await db.update_client(client["telegram_id"], stall_prompted=1)
+        except Exception:
+            log.exception("Не удалось напомнить о голосовом %s", client["telegram_id"])
 
 
 async def main() -> None:

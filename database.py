@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS clients (
     level TEXT,
     status TEXT DEFAULT 'new',
     stall_prompted INTEGER DEFAULT 0,
+    voice_status TEXT DEFAULT '',
     last_activity TEXT,
     created_at TEXT
 );
@@ -62,12 +63,16 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA)
         await db.commit()
-        # Миграция для базы, созданной до появления колонки "level"
-        try:
-            await db.execute("ALTER TABLE clients ADD COLUMN level TEXT")
-            await db.commit()
-        except aiosqlite.OperationalError:
-            pass  # колонка уже есть
+        # Миграции для баз, созданных до появления новых колонок
+        for stmt in (
+            "ALTER TABLE clients ADD COLUMN level TEXT",
+            "ALTER TABLE clients ADD COLUMN voice_status TEXT DEFAULT ''",
+        ):
+            try:
+                await db.execute(stmt)
+                await db.commit()
+            except aiosqlite.OperationalError:
+                pass  # колонка уже есть
 
 
 async def get_or_create_client(telegram_id: int, username: str | None) -> dict:
@@ -144,6 +149,37 @@ async def create_booking(client_id: int, date: str, time: str) -> int:
         return cur.lastrowid
 
 
+async def delete_bookings_of(telegram_id: int) -> int:
+    """Полностью удалить все записи одного человека (используется для чистки
+    собственных тестовых записей). Возвращает количество удалённых."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """DELETE FROM bookings
+               WHERE client_id IN (SELECT id FROM clients WHERE telegram_id = ?)""",
+            (telegram_id,),
+        )
+        await db.commit()
+        return cur.rowcount or 0
+
+
+async def wipe_all_data() -> dict:
+    """Удалить все записи, заявки и карточки клиентов. Тексты, отредактированные
+    через /texts, НЕ трогаются."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT COUNT(*) FROM bookings")
+        bookings = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM clients")
+        clients = (await cur.fetchone())[0]
+        cur = await db.execute("SELECT COUNT(*) FROM waitlist")
+        waits = (await cur.fetchone())[0]
+
+        await db.execute("DELETE FROM bookings")
+        await db.execute("DELETE FROM waitlist")
+        await db.execute("DELETE FROM clients")
+        await db.commit()
+        return {"bookings": bookings, "clients": clients, "waitlist": waits}
+
+
 async def add_waitlist(client_id: int, desired_text: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -163,6 +199,22 @@ async def get_stalled_clients(statuses: list[str], older_than_iso: str) -> list[
                   AND stall_prompted = 0
                   AND last_activity < ?""",
             (*statuses, older_than_iso),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_clients_awaiting_voice(older_than_iso: str) -> list[dict]:
+    """Записавшиеся, но пока не приславшие голосовое — для одного напоминания."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM clients
+               WHERE status = 'booked'
+                 AND voice_status = 'awaiting'
+                 AND stall_prompted = 0
+                 AND last_activity < ?""",
+            (older_than_iso,),
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
@@ -253,7 +305,7 @@ async def get_all_clients_for_export() -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            """SELECT c.full_name, c.level, c.status, c.contact, c.username,
+            """SELECT c.full_name, c.level, c.status, c.voice_status, c.contact, c.username,
                       c.telegram_id, c.created_at, c.last_activity,
                       (SELECT b.date FROM bookings b
                         WHERE b.client_id = c.id AND b.status = 'confirmed'
