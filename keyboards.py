@@ -48,8 +48,6 @@ def materials_kb(url: str, button_text: str) -> InlineKeyboardMarkup:
 
 def stall_reasons_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="Я передумал(а)", callback_data="reason:changed_mind")
-    kb.button(text="Не нашёл(ла) время", callback_data="reason:no_time")
-    kb.button(text="Согласовываю с родителями", callback_data="reason:asking_parent")
+    kb.button(text="Не нашла подходящее время", callback_data="reason:no_time")
     kb.adjust(1)
     return kb.as_markup()

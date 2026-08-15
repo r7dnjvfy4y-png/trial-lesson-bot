@@ -128,25 +128,75 @@ async def get_client(telegram_id: int) -> dict | None:
 
 
 async def count_booked(date: str, time: str) -> int:
-    """Сколько подтверждённых записей уже занимают этот слот (дата+время)."""
+    """Сколько мест в слоте занято. Считаются и подтверждённые записи, и
+    'pending' — те, кто выбрал время и сейчас записывает голосовое: место за
+    ними держится, чтобы его не занял кто-то другой."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT COUNT(*) FROM bookings WHERE date = ? AND time = ? AND status = 'confirmed'",
+            """SELECT COUNT(*) FROM bookings
+               WHERE date = ? AND time = ? AND status IN ('confirmed', 'pending')""",
             (date, time),
         )
         row = await cur.fetchone()
         return row[0] if row else 0
 
 
-async def create_booking(client_id: int, date: str, time: str) -> int:
+async def create_booking(client_id: int, date: str, time: str, status: str = "confirmed") -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             """INSERT INTO bookings (client_id, date, time, status, created_at)
-               VALUES (?, ?, ?, 'confirmed', ?)""",
-            (client_id, date, time, _now()),
+               VALUES (?, ?, ?, ?, ?)""",
+            (client_id, date, time, status, _now()),
         )
         await db.commit()
         return cur.lastrowid
+
+
+async def confirm_booking(booking_id: int) -> dict | None:
+    """Перевести бронь из 'pending' в 'confirmed' (после голосового)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute(
+            "UPDATE bookings SET status = 'confirmed' WHERE id = ? AND status = 'pending'",
+            (booking_id,),
+        )
+        await db.commit()
+        cur = await db.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def drop_pending_of(telegram_id: int) -> None:
+    """Убрать незавершённые брони человека — например, если он начал заново."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """DELETE FROM bookings
+               WHERE status = 'pending'
+                 AND client_id IN (SELECT id FROM clients WHERE telegram_id = ?)""",
+            (telegram_id,),
+        )
+        await db.commit()
+
+
+async def release_stale_pending(older_than_iso: str) -> list[dict]:
+    """Освободить места, забронированные под голосовое, но так и не
+    подтверждённые. Возвращает список освобождённых броней."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT b.id, b.date, b.time, c.telegram_id, c.full_name
+               FROM bookings b JOIN clients c ON c.id = b.client_id
+               WHERE b.status = 'pending' AND b.created_at < ?""",
+            (older_than_iso,),
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        if rows:
+            await db.execute(
+                "DELETE FROM bookings WHERE status = 'pending' AND created_at < ?",
+                (older_than_iso,),
+            )
+            await db.commit()
+        return rows
 
 
 async def delete_bookings_of(telegram_id: int) -> int:
@@ -235,18 +285,51 @@ async def get_today_bookings(date: str) -> list[dict]:
 
 
 async def get_slot_roster(date: str, time: str) -> list[dict]:
-    """Список участников конкретного слота (для просмотра, кто уже записан)."""
+    """Кто записан в конкретный слот — с id брони, чтобы её можно было
+    удалить или перенести из админ-меню /manage."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            """SELECT c.full_name, c.contact, c.username
+            """SELECT b.id AS booking_id, b.status AS booking_status, b.date, b.time,
+                      c.telegram_id, c.full_name, c.contact, c.username, c.level, c.voice_status
                FROM bookings b JOIN clients c ON c.id = b.client_id
-               WHERE b.date = ? AND b.time = ? AND b.status = 'confirmed'
+               WHERE b.date = ? AND b.time = ? AND b.status IN ('confirmed', 'pending')
                ORDER BY b.created_at""",
             (date, time),
         )
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+async def get_booking(booking_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT b.id AS booking_id, b.date, b.time, b.status AS booking_status,
+                      c.telegram_id, c.full_name, c.contact, c.username, c.level
+               FROM bookings b JOIN clients c ON c.id = b.client_id
+               WHERE b.id = ?""",
+            (booking_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def delete_booking(booking_id: int) -> None:
+    """Удалить одну конкретную запись — место в слоте освобождается."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
+        await db.commit()
+
+
+async def move_booking(booking_id: int, date: str, time: str) -> None:
+    """Перенести запись в другой слот (дата+время)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE bookings SET date = ?, time = ? WHERE id = ?",
+            (date, time, booking_id),
+        )
+        await db.commit()
 
 
 async def get_recent_clients(limit: int = 30) -> list[dict]:
