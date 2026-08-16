@@ -243,11 +243,9 @@ async def chose_date(callback: CallbackQuery, state: FSMContext) -> None:
         booking_time=time_hm,
     )
 
-    # Пока только просим голосовое — подтверждение придёт после него
-    await callback.message.edit_text(
-        f"Отлично, держу за вами место — {_fmt_dt(date_iso, time_hm)}.", reply_markup=None
-    )
-    await callback.message.answer(await texts.get_text("voice_request"))
+    # Сразу просим голосовое — подтверждение придёт только после него.
+    # Список дат заменяем самой просьбой, чтобы лишних сообщений не было.
+    await callback.message.edit_text(await texts.get_text("voice_request"), reply_markup=None)
     await callback.answer()
 
 
@@ -282,9 +280,7 @@ async def got_voice(message: Message, state: FSMContext) -> None:
 
     when = _fmt_dt(date_iso, time_hm)
 
-    # 1) короткое спасибо за аудио, 2) подтверждение записи с материалами
-    await message.answer(await texts.get_text("voice_received"))
-
+    # Сразу подтверждение записи с материалами — без промежуточного «спасибо»
     confirm_text = await texts.get_text("booking_confirmed", when=when)
     if config.QUIZLET_LINK:
         button_text = await texts.get_text("materials_button")
@@ -335,7 +331,9 @@ async def late_voice(message: Message) -> None:
         return
 
     await db.update_client(message.from_user.id, voice_status="received", stall_prompted=1)
-    await message.answer(await texts.get_text("voice_received"))
+    # Короткий ответ только здесь: это голосовое пришло уже вне записи
+    # (например, после напоминания) — молчание выглядело бы как поломка.
+    await message.answer("Получила ваше голосовое, спасибо 🎧")
 
     if config.ADMIN_CHAT_ID:
         try:
