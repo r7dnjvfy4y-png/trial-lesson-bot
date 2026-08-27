@@ -1,64 +1,114 @@
 """
-Генерация доступных дат/времени под расписание по уровням (config.WEEKLY_SCHEDULE).
+Слоты рассчитываются на лету из повторяющихся правил расписания (таблица
+schedule_rules) — вручную ничего создавать не нужно. Разово отменённые
+слоты берутся из slot_blocks.
 """
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import config
+import database as db
 
 WEEKDAY_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+WEEKDAY_FULL = [
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+]
 MONTH_RU = [
     "", "янв", "фев", "мар", "апр", "мая", "июн",
     "июл", "авг", "сен", "окт", "ноя", "дек",
 ]
 
 
-def _tz() -> ZoneInfo:
+def tz() -> ZoneInfo:
     return ZoneInfo(config.TIMEZONE)
 
 
 def now_local() -> datetime:
-    return datetime.now(_tz())
+    return datetime.now(tz())
 
 
-def format_date_label(date_iso: str) -> str:
+def slot_dt(date_iso: str, time_hm: str) -> datetime:
+    return datetime.strptime(f"{date_iso} {time_hm}", "%Y-%m-%d %H:%M").replace(tzinfo=tz())
+
+
+def format_date(date_iso: str) -> str:
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     return f"{WEEKDAY_RU[d.weekday()]}, {d.day} {MONTH_RU[d.month]}"
 
 
-def slots_for_weekday_and_level(weekday: int, level_name: str) -> list[str]:
-    """Все времена в этот день недели, относящиеся к заданному уровню."""
-    return [t for t, lvl in config.WEEKLY_SCHEDULE.get(weekday, []) if lvl == level_name]
+def format_when(date_iso: str, time_hm: str) -> str:
+    d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    return f"{WEEKDAY_RU[d.weekday()]}, {d.day} {MONTH_RU[d.month]} в {time_hm}"
 
 
-def candidate_date_times(level_name: str) -> list[tuple[str, str]]:
-    """Все (date_iso, time_hm) в пределах DAYS_AHEAD для уровня, в
-    хронологическом порядке — без учёта занятости (это фильтруется отдельно
-    в bot.py по данным из базы)."""
+def is_too_late(date_iso: str, time_hm: str) -> bool:
+    return slot_dt(date_iso, time_hm) < now_local() + timedelta(hours=config.MIN_NOTICE_HOURS)
+
+
+async def upcoming_slots(level: str | None = None) -> list[dict]:
+    """Все слоты на ближайшие DAYS_AHEAD дней: дата, время, уровень,
+    вместимость и сколько мест уже занято."""
+    rules = await db.get_rules()
+    if level:
+        rules = [r for r in rules if r["level"] == level]
+    if not rules:
+        return []
+
+    blocks = await db.get_blocks()
+    by_weekday: dict[int, list[dict]] = {}
+    for r in rules:
+        by_weekday.setdefault(r["weekday"], []).append(r)
+
     today = now_local().date()
-    result: list[tuple[str, str]] = []
-    for i in range(config.DAYS_AHEAD):
-        d = today + timedelta(days=i)
-        for t in slots_for_weekday_and_level(d.weekday(), level_name):
-            result.append((d.isoformat(), t))
-    return result
+    slots = []
+    for offset in range(config.DAYS_AHEAD):
+        day = today + timedelta(days=offset)
+        for rule in sorted(by_weekday.get(day.weekday(), []), key=lambda x: x["time"]):
+            date_iso = day.isoformat()
+            if (date_iso, rule["time"], rule["level"]) in blocks:
+                continue
+            if is_too_late(date_iso, rule["time"]):
+                continue
+            taken = await db.count_taken(date_iso, rule["time"], rule["level"])
+            slots.append({
+                "date": date_iso,
+                "time": rule["time"],
+                "level": rule["level"],
+                "capacity": rule["capacity"],
+                "taken": taken,
+                "free": max(rule["capacity"] - taken, 0),
+            })
+    return slots
 
 
-def all_candidate_date_times() -> list[tuple[str, str, str]]:
-    """Все (date_iso, time_hm, level) в пределах DAYS_AHEAD по всем уровням —
-    используется для админского обзора заполненности слотов."""
+async def free_slots(level: str) -> list[dict]:
+    return [s for s in await upcoming_slots(level) if s["free"] > 0]
+
+
+async def slot_capacity(date_iso: str, time_hm: str, level: str) -> int:
+    """Вместимость конкретного слота по правилу расписания."""
+    weekday = datetime.strptime(date_iso, "%Y-%m-%d").weekday()
+    for r in await db.get_rules():
+        if r["weekday"] == weekday and r["time"] == time_hm and r["level"] == level:
+            return r["capacity"]
+    return config.DEFAULT_CAPACITY
+
+
+async def is_slot_available(date_iso: str, time_hm: str, level: str) -> bool:
+    if is_too_late(date_iso, time_hm):
+        return False
+    if (date_iso, time_hm, level) in await db.get_blocks():
+        return False
+    capacity = await slot_capacity(date_iso, time_hm, level)
+    return await db.count_taken(date_iso, time_hm, level) < capacity
+
+
+def group_by_week(slots: list[dict]) -> list[list[dict]]:
+    """Разбить слоты по неделям — для кнопки «на следующей неделе»."""
     today = now_local().date()
-    result: list[tuple[str, str, str]] = []
-    for i in range(config.DAYS_AHEAD):
-        d = today + timedelta(days=i)
-        for t, lvl in config.WEEKLY_SCHEDULE.get(d.weekday(), []):
-            result.append((d.isoformat(), t, lvl))
-    return result
-
-
-def is_in_the_past_with_notice(date_iso: str, time_hm: str) -> bool:
-    """True, если слот наступает раньше, чем через MIN_NOTICE_HOURS от сейчас."""
-    threshold = now_local() + timedelta(hours=config.MIN_NOTICE_HOURS)
-    slot_dt = datetime.strptime(f"{date_iso} {time_hm}", "%Y-%m-%d %H:%M").replace(tzinfo=_tz())
-    return slot_dt < threshold
+    weeks: dict[int, list[dict]] = {}
+    for s in slots:
+        d = datetime.strptime(s["date"], "%Y-%m-%d").date()
+        weeks.setdefault((d - today).days // 7, []).append(s)
+    return [weeks[k] for k in sorted(weeks)]

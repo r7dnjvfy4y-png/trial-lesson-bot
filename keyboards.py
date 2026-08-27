@@ -2,52 +2,46 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import config
-from scheduling import format_date_label
+import scheduling
 
 
-def level_kb() -> InlineKeyboardMarkup:
+def slot_key(slot: dict) -> str:
+    return f"{slot['date']}|{slot['time']}|{slot['level']}"
+
+
+def levels_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    for lvl in config.DISPLAY_LEVELS:
-        kb.button(text=lvl, callback_data=f"level:{lvl}")
-    kb.adjust(len(config.DISPLAY_LEVELS))
+    for lvl in config.LEVELS:
+        kb.button(text=lvl, callback_data=f"lvl:{lvl}")
+    kb.adjust(len(config.LEVELS))
     return kb.as_markup()
 
 
-def dates_kb(
-    slots: list[tuple[str, str]], has_next_week: bool, next_page_index: int
+def slots_kb(
+    slots: list[dict],
+    page: int,
+    has_next: bool,
+    no_time_text: str,
+    prefix: str = "sl",
 ) -> InlineKeyboardMarkup:
-    """slots — список (date_iso, time_hm), уже отфильтрованных свободных
-    мест для текущей "страницы" (недели)."""
+    """prefix: 'sl' — обычная запись, 'rs' — выбор времени после смены уровня."""
     kb = InlineKeyboardBuilder()
-    for date_iso, time_hm in slots:
-        label = f"{format_date_label(date_iso)} · {time_hm}"
-        kb.button(text=label, callback_data=f"date:{date_iso}:{time_hm}")
-    kb.adjust(1)
-    if has_next_week:
-        kb.row(
-            InlineKeyboardButton(
-                text="📅 Посмотреть запись на следующей неделе",
-                callback_data=f"week:{next_page_index}",
-            )
+    for s in slots:
+        kb.button(
+            text=f"{scheduling.format_date(s['date'])} · {s['time']}",
+            callback_data=f"{prefix}:{slot_key(s)}",
         )
-    kb.row(InlineKeyboardButton(text="🙈 Не нашли подходящее время", callback_data="no_time_found"))
-    return kb.as_markup()
-
-
-def waitlist_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Записаться в лист ожидания", callback_data="join_waitlist")
-    return kb.as_markup()
-
-
-def materials_kb(url: str, button_text: str) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.row(InlineKeyboardButton(text=button_text, url=url))
-    return kb.as_markup()
-
-
-def stall_reasons_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="Не нашла подходящее время", callback_data="reason:no_time")
     kb.adjust(1)
+    if has_next:
+        kb.row(InlineKeyboardButton(
+            text="📅 Посмотреть следующую неделю",
+            callback_data=f"{prefix}w:{page + 1}",
+        ))
+    kb.row(InlineKeyboardButton(text=no_time_text, callback_data="notime"))
+    return kb.as_markup()
+
+
+def materials_kb(url: str, text: str = "📚 Материалы к уроку") -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=text, url=url))
     return kb.as_markup()

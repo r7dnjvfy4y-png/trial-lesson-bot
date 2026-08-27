@@ -1,899 +1,103 @@
 """
-Telegram-бот для записи на бесплатный пробный урок — группами по уровням.
+Бот записи на пробные уроки.
 
-Логика:
-  Шаг 1 — /start сразу показывает приветствие и кнопки уровня (A2/B1/B2)
-  Шаг 2 — бот показывает свободные даты/время для этого уровня (эта неделя),
-          с кнопкой «Посмотреть запись на следующей неделе» и кнопкой
-          «Не нашли подходящее время» на каждом экране
-  Шаг 3 — ученица нажимает на дату/время и сразу получает подтверждение —
-          отдельного шага «оставьте контакт» нет: контакт — это её Telegram
-          (username и Telegram-профиль)
-  Если мест на выбранное время не осталось (набралось 6 человек) или в
-  расписании вообще нет мест — бот предлагает записаться в лист ожидания.
+Флоу ученицы:
+  уровень → время (слот закрепляется) → голосовое на английском →
+  «Анастасия послушает и вернётся с подтверждением»
 
-Все тексты бота вынесены в texts.py и редактируются администратором прямо в
-Telegram, командой /texts — без правки кода (см. README).
+Флоу преподавателя (в Telegram, команда /admin):
+  приходит карточка + голосовое + кнопки «Всё верно» / «Изменить уровень».
+  Подтвердила → ученице уходят ссылка и материалы её уровня, слот занят.
+  Изменила уровень → старый слот освобождается, ученица выбирает время
+  заново уже под новый уровень и сразу получает ссылку и материалы.
 
-Оплаты в этом боте нет — пробный урок бесплатный.
+Напоминания: за день и за час до урока, оба со ссылкой.
+
+Расписание, ссылка, материалы и все тексты редактируются в /admin — код
+для этого трогать не нужно.
 """
 
 import asyncio
-import csv
-import io
 import logging
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, Message
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import admin
 import config
 import database as db
 import scheduling
+import student
 import texts
-from keyboards import (
-    dates_kb,
-    level_kb,
-    materials_kb,
-    stall_reasons_kb,
-    waitlist_kb,
-)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("trial_lesson_bot")
 
-router = Router()
 
-STALLED_STATUSES = ["choosing_date"]
-
-STATUS_LABELS = {
-    "new": "🆕 новый диалог",
-    "choosing_date": "⏳ выбирает дату",
-    "awaiting_voice": "🎙 записывает голосовое",
-    "booked": "✅ записан(а)",
-    "voice_expired": "⚪️ место освободили (нет голосового)",
-    "waitlist_prompted": "🟠 предложили лист ожидания",
-    "waitlist": "🟠 в листе ожидания",
-}
-
-VOICE_LABELS = {
-    "": "—",
-    "awaiting": "🎙 ждём голосовое",
-    "received": "🎧 голосовое прислано",
-}
-
-
-class Booking(StatesGroup):
-    waiting_date = State()
-    waiting_voice = State()
-
-
-class EditingText(StatesGroup):
-    waiting_new_text = State()
-
-
-def _fmt_dt(date_iso: str, time_hm: str) -> str:
-    d = datetime.strptime(date_iso, "%Y-%m-%d").date()
-    return f"{scheduling.WEEKDAY_RU[d.weekday()]}, {d.day} {scheduling.MONTH_RU[d.month]} в {time_hm}"
-
-
-def _is_admin(telegram_id: int) -> bool:
-    return bool(config.ADMIN_CHAT_ID) and telegram_id == config.ADMIN_CHAT_ID
-
-
-async def notify_admin(bot: Bot, text: str) -> None:
-    if not config.ADMIN_CHAT_ID:
-        return
-    try:
-        await bot.send_message(config.ADMIN_CHAT_ID, text)
-    except Exception:
-        log.exception("Не удалось отправить уведомление админу")
-
-
-async def compute_available_pages(group: str) -> list[list[tuple[str, str]]]:
-    """Свободные слоты для группы расписания, сгруппированные по неделям
-    (страницам). Полностью занятые недели просто не попадают в список —
-    так следующая страница естественным образом показывает следующую
-    свободную неделю."""
-    today = scheduling.now_local().date()
-    by_week: dict[int, list[tuple[str, str]]] = {}
-    for date_iso, time_hm in scheduling.candidate_date_times(group):
-        if scheduling.is_in_the_past_with_notice(date_iso, time_hm):
-            continue
-        count = await db.count_booked(date_iso, time_hm)
-        if count >= config.CAPACITY_PER_SLOT:
-            continue
-        d = datetime.strptime(date_iso, "%Y-%m-%d").date()
-        week_idx = (d - today).days // 7
-        by_week.setdefault(week_idx, []).append((date_iso, time_hm))
-    return [by_week[w] for w in sorted(by_week.keys())]
-
-
-async def send_date_page(message: Message, pages: list, page_index: int, is_first: bool) -> None:
-    slots = pages[page_index]
-    has_next = page_index + 1 < len(pages)
-    text = await texts.get_text("choose_date_now" if is_first else "choose_date_next")
-    await message.answer(text, reply_markup=dates_kb(slots, has_next, page_index + 1))
-
-
-async def send_no_time_prompt(message: Message) -> None:
-    text = await texts.get_text("no_time_found")
-    await message.answer(text, reply_markup=waitlist_kb())
-
-
-# ---------------------------------------------------------------- /start ---
-
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await db.get_or_create_client(message.from_user.id, message.from_user.username)
-    await db.update_client(message.from_user.id, status="new", stall_prompted=0)
-
-    text = await texts.get_text("welcome")
-    await message.answer(text, reply_markup=level_kb(), disable_web_page_preview=True)
-
-
-# ----------------------------------------------------------- шаг: уровень --
-
-@router.callback_query(F.data.startswith("level:"))
-async def chose_level(callback: CallbackQuery, state: FSMContext) -> None:
-    level_display = callback.data.split(":", 1)[1]
-    if level_display not in config.DISPLAY_LEVELS:
-        await callback.answer()
-        return
-    group = config.LEVEL_TO_GROUP[level_display]
-
-    await state.update_data(level_display=level_display, level_group=group)
-    await db.update_client(
-        callback.from_user.id, level=level_display, status="choosing_date", stall_prompted=0
-    )
-
-    pages = await compute_available_pages(group)
-    if not pages:
-        await db.update_client(callback.from_user.id, status="waitlist_prompted", stall_prompted=0)
-        await send_no_time_prompt(callback.message)
-        await callback.answer()
-        return
-
-    await state.set_state(Booking.waiting_date)
-    await send_date_page(callback.message, pages, 0, is_first=True)
-    await callback.answer()
-
-
-# ---------------------------------------------------- шаг: следующая неделя --
-
-@router.callback_query(Booking.waiting_date, F.data.startswith("week:"))
-async def next_week(callback: CallbackQuery, state: FSMContext) -> None:
-    idx = int(callback.data.split(":", 1)[1])
-    data = await state.get_data()
-    group = data.get("level_group")
-
-    await db.touch_client(callback.from_user.id)
-
-    pages = await compute_available_pages(group)
-    if idx >= len(pages):
-        await callback.answer("На эту неделю мест больше нет", show_alert=True)
-        if pages:
-            await send_date_page(callback.message, pages, len(pages) - 1, is_first=False)
-        else:
-            await db.update_client(callback.from_user.id, status="waitlist_prompted", stall_prompted=0)
-            await send_no_time_prompt(callback.message)
-        return
-
-    await send_date_page(callback.message, pages, idx, is_first=False)
-    await callback.answer()
-
-
-# ---------------------------------------------------------- шаг: дата -----
-
-@router.callback_query(Booking.waiting_date, F.data.startswith("date:"))
-async def chose_date(callback: CallbackQuery, state: FSMContext) -> None:
-    _, date_iso, time_hm = callback.data.split(":", 2)
-    data = await state.get_data()
-    group = data.get("level_group")
-    level_display = data.get("level_display", "—")
-
-    await db.touch_client(callback.from_user.id)
-
-    count = await db.count_booked(date_iso, time_hm)
-    full = count >= config.CAPACITY_PER_SLOT
-    expired = scheduling.is_in_the_past_with_notice(date_iso, time_hm)
-
-    if full or expired:
-        pages = await compute_available_pages(group)
-        await callback.answer("Это время уже заполнено", show_alert=True)
-        if pages:
-            await send_date_page(callback.message, pages, 0, is_first=True)
-        else:
-            await db.update_client(callback.from_user.id, status="waitlist_prompted", stall_prompted=0)
-            await send_no_time_prompt(callback.message)
-        return
-
-    full_name = callback.from_user.full_name
-    username = callback.from_user.username
-    contact = f"@{username}" if username else f"id{callback.from_user.id}"
-
-    await db.update_client(
-        callback.from_user.id,
-        full_name=full_name,
-        contact=contact,
-        status="awaiting_voice",
-        voice_status="awaiting",
-        stall_prompted=0,
-    )
-    client = await db.get_client(callback.from_user.id)
-
-    # Место держим за ней ('pending'), но запись подтвердим только после
-    # голосового — иначе слот мог бы занять кто-то другой, пока она записывает.
-    await db.drop_pending_of(callback.from_user.id)
-    booking_id = await db.create_booking(client["id"], date_iso, time_hm, status="pending")
-
-    await state.set_state(Booking.waiting_voice)
-    await state.update_data(
-        level_display=level_display,
-        booking_id=booking_id,
-        booking_date=date_iso,
-        booking_time=time_hm,
-    )
-
-    # Сразу просим голосовое — подтверждение придёт только после него.
-    # Список дат заменяем самой просьбой, чтобы лишних сообщений не было.
-    await callback.message.edit_text(await texts.get_text("voice_request"), reply_markup=None)
-    await callback.answer()
-
-
-# ------------------------------------- голосовое для диагностики уровня ----
-
-@router.message(Booking.waiting_voice, F.voice | F.audio | F.video_note)
-async def got_voice(message: Message, state: FSMContext) -> None:
-    """Голосовое получено — только теперь запись становится подтверждённой,
-    и ученица видит подтверждение с материалами."""
-    data = await state.get_data()
-    level_display = data.get("level_display", "—")
-    booking_id = data.get("booking_id")
-    date_iso = data.get("booking_date")
-    time_hm = data.get("booking_time")
-
-    booking = await db.confirm_booking(booking_id) if booking_id else None
-    if booking is None:
-        # Бронь успели снять (например, истекло время удержания) — просим выбрать заново
-        await state.clear()
-        await db.update_client(message.from_user.id, status="new", voice_status="", stall_prompted=0)
-        await message.answer(
-            "Спасибо за голосовое! Только место, к сожалению, уже освободилось за это время — "
-            "давайте выберем время заново: /start"
-        )
-        return
-
-    await db.update_client(
-        message.from_user.id, status="booked", voice_status="received", stall_prompted=0
-    )
-    client = await db.get_client(message.from_user.id)
-    await state.clear()
-
-    when = _fmt_dt(date_iso, time_hm)
-
-    # Сразу подтверждение записи с материалами — без промежуточного «спасибо»
-    confirm_text = await texts.get_text("booking_confirmed", when=when)
-    if config.QUIZLET_LINK:
-        button_text = await texts.get_text("materials_button")
-        await message.answer(
-            confirm_text, reply_markup=materials_kb(config.QUIZLET_LINK, button_text)
-        )
-    else:
-        await message.answer(confirm_text)
-
-    # Преподавателю — карточка ученицы и следом само аудио
-    if config.ADMIN_CHAT_ID:
-        name = (client or {}).get("full_name") or message.from_user.full_name
-        contact = (client or {}).get("contact") or f"@{message.from_user.username or '—'}"
-        taken = await db.count_booked(date_iso, time_hm)
-        spots_left = max(config.CAPACITY_PER_SLOT - taken, 0)
-        try:
-            await message.bot.send_message(
-                config.ADMIN_CHAT_ID,
-                (
-                    "🟢 Новая запись на пробный урок (с голосовым)\n"
-                    f"Имя: {name}\n"
-                    f"Заявленный уровень: {level_display}\n"
-                    f"Урок: {when}\n"
-                    f"Осталось мест в группе: {spots_left}\n"
-                    f"Telegram: {contact} (id {message.from_user.id})"
-                ),
-            )
-            await message.forward(config.ADMIN_CHAT_ID)
-        except Exception:
-            log.exception("Не удалось переслать голосовое админу")
-
-
-@router.message(Booking.waiting_voice, ~F.text.startswith("/"))
-async def voice_expected(message: Message) -> None:
-    """Ученица прислала что-то не то (текст, стикер, фото) — мягко повторяем просьбу.
-    Команды (текст, начинающийся с "/") сюда не попадают — иначе на шаге ожидания
-    голосового перестали бы работать админ-команды вроде /leads и /texts."""
-    await db.touch_client(message.from_user.id)
-    await message.answer(await texts.get_text("voice_nudge"))
-
-
-@router.message(F.voice | F.audio | F.video_note)
-async def late_voice(message: Message) -> None:
-    """Голосовое пришло позже, вне шага записи (например, после напоминания
-    или уже после того, как ученица записалась ранее)."""
-    client = await db.get_client(message.from_user.id)
-    if not client:
-        return
-
-    await db.update_client(message.from_user.id, voice_status="received", stall_prompted=1)
-    # Короткий ответ только здесь: это голосовое пришло уже вне записи
-    # (например, после напоминания) — молчание выглядело бы как поломка.
-    await message.answer("Получила ваше голосовое, спасибо 🎧")
-
-    if config.ADMIN_CHAT_ID:
-        try:
-            await message.bot.send_message(
-                config.ADMIN_CHAT_ID,
-                (
-                    "🎧 Голосовое для диагностики уровня\n"
-                    f"Имя: {client.get('full_name') or message.from_user.full_name}\n"
-                    f"Заявленный уровень: {client.get('level') or '—'}\n"
-                    f"Telegram: {client.get('contact') or '@' + (message.from_user.username or '—')} "
-                    f"(id {message.from_user.id})"
-                ),
-            )
-            await message.forward(config.ADMIN_CHAT_ID)
-        except Exception:
-            log.exception("Не удалось переслать голосовое админу")
-
-
-# --------------------------------------------- «не нашли время» / лист ожидания --
-
-@router.callback_query(F.data == "no_time_found")
-async def no_time_found(callback: CallbackQuery, state: FSMContext) -> None:
-    await db.update_client(callback.from_user.id, status="waitlist_prompted", stall_prompted=0)
-    await send_no_time_prompt(callback.message)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "join_waitlist")
-async def join_waitlist(callback: CallbackQuery, state: FSMContext) -> None:
-    client = await db.get_client(callback.from_user.id)
-    data = await state.get_data()
-    level_display = data.get("level_display") or (client or {}).get("level") or "—"
-
-    await db.add_waitlist(client["id"], f"уровень {level_display}")
-    await db.update_client(callback.from_user.id, status="waitlist", stall_prompted=0)
-
-    text = await texts.get_text("waitlist_confirmed")
-    await callback.message.answer(text)
-
-    await notify_admin(
-        callback.bot,
-        (
-            "🟠 Лист ожидания\n"
-            f"Имя: {client.get('full_name') or callback.from_user.full_name}\n"
-            f"Уровень: {level_display}\n"
-            f"Telegram: @{callback.from_user.username or '—'} (id {callback.from_user.id})"
-        ),
-    )
-    await state.clear()
-    await callback.answer()
-
-
-# --------------------------------------------------- реакции "завис(ла)" ---
-
-@router.callback_query(F.data.startswith("reason:"))
-async def stall_reason(callback: CallbackQuery, state: FSMContext) -> None:
-    reason = callback.data.split(":", 1)[1]
-
-    if reason == "no_time":
-        await db.update_client(callback.from_user.id, status="waitlist_prompted", stall_prompted=1)
-        await send_no_time_prompt(callback.message)
-
-    await callback.answer()
-
-
-# --------------------------------------------------------- админ-команды ---
-# Здесь и собираются все записи и контакты — подробнее в README, раздел
-# "Где смотреть записи и контакты".
-
-@router.message(Command("today"))
-async def cmd_today(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    today = scheduling.now_local().date().isoformat()
-    rows = await db.get_today_bookings(today)
-    if not rows:
-        await message.answer("На сегодня записей нет.")
-        return
-    lines = [f"Записи на сегодня ({today}):"]
-    for r in rows:
-        lines.append(
-            f"• {r['time']} ({r['level'] or '—'}) — {r['full_name']} ({r['contact']})"
-        )
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("slots"))
-async def cmd_slots(message: Message) -> None:
-    """Заполненность ближайших слотов по каждой группе расписания."""
-    if not _is_admin(message.from_user.id):
-        return
-
-    lines = ["Заполненность ближайших слотов:"]
-    shown = 0
-    for date_iso, time_hm, group in scheduling.all_candidate_date_times():
-        if scheduling.is_in_the_past_with_notice(date_iso, time_hm):
-            continue
-        count = await db.count_booked(date_iso, time_hm)
-        lines.append(
-            f"{scheduling.format_date_label(date_iso)} {time_hm} ({group}) — "
-            f"{count}/{config.CAPACITY_PER_SLOT}"
-        )
-        shown += 1
-        if shown >= 12:
-            break
-
-    if shown == 0:
-        await message.answer("В ближайшее время слотов по расписанию нет.")
-        return
-    await message.answer("\n".join(lines))
-
-
-@router.message(Command("leads"))
-async def cmd_leads(message: Message) -> None:
-    """Список последних заявок и на каком они этапе — весь процесс на виду."""
-    if not _is_admin(message.from_user.id):
-        return
-
-    clients = await db.get_recent_clients(limit=30)
-    if not clients:
-        await message.answer("Пока ни одной заявки.")
-        return
-
-    lines = ["Последние заявки (обновляется в реальном времени):"]
-    for c in clients:
-        label = STATUS_LABELS.get(c["status"], c["status"])
-        line = f"\n{c['full_name'] or '—'} — {label}"
-        if c.get("level"):
-            line += f"\nУровень: {c['level']}"
-        if c.get("booking_date"):
-            line += f"\nЗаписан(а): {_fmt_dt(c['booking_date'], c['booking_time'])}"
-        if c.get("voice_status"):
-            line += f"\nГолосовое: {VOICE_LABELS.get(c['voice_status'], c['voice_status'])}"
-        if c.get("contact"):
-            line += f"\nКонтакт: {c['contact']}"
-        line += f"\nTelegram: @{c['username'] or '—'}"
-        lines.append(line)
-
-    text = "\n".join(lines)
-    for i in range(0, len(text), 3500):
-        await message.answer(text[i:i + 3500])
-
-
-@router.message(Command("export"))
-async def cmd_export(message: Message) -> None:
-    """Выгрузка всех заявок и контактов в CSV — можно открыть в Excel/Google Таблицах."""
-    if not _is_admin(message.from_user.id):
-        return
-
-    rows = await db.get_all_clients_for_export()
-    if not rows:
-        await message.answer("Пока нечего выгружать.")
-        return
-
-    buffer = io.StringIO()
-    writer = csv.DictWriter(
-        buffer,
-        fieldnames=[
-            "full_name", "level", "status", "voice_status", "contact", "username",
-            "telegram_id", "booking_date", "booking_time", "created_at", "last_activity",
-        ],
-    )
-    writer.writeheader()
-    for r in rows:
-        r = dict(r)
-        r["status"] = STATUS_LABELS.get(r["status"], r["status"])
-        r["voice_status"] = VOICE_LABELS.get(r.get("voice_status") or "", r.get("voice_status"))
-        writer.writerow(r)
-
-    csv_bytes = buffer.getvalue().encode("utf-8-sig")  # BOM, чтобы Excel не ломал кириллицу
-    document = BufferedInputFile(csv_bytes, filename="leads.csv")
-    await message.answer_document(document, caption="Все заявки и контакты")
-
-
-# ------------------------------------ управление записями (/manage) --------
-# Выбрать любой слот → любого человека → удалить его запись или перенести
-# в другой слот. Точечно, по одному, без массовых удалений.
-
-def _slot_key(date_iso: str, time_hm: str) -> str:
-    """Компактный ключ слота для callback_data (там всего 64 байта)."""
-    return f"{date_iso}|{time_hm}"
-
-
-async def _upcoming_slots() -> list[tuple[str, str, str, int]]:
-    """(date_iso, time_hm, группа, занято) по всем ближайшим слотам расписания."""
-    result = []
-    for date_iso, time_hm, group in scheduling.all_candidate_date_times():
-        if scheduling.is_in_the_past_with_notice(date_iso, time_hm):
-            continue
-        taken = await db.count_booked(date_iso, time_hm)
-        result.append((date_iso, time_hm, group, taken))
-    return result
-
-
-async def render_slots_menu(message: Message, move_booking_id: int | None = None) -> None:
-    """Список слотов. Если задан move_booking_id — выбор слота, КУДА переносим."""
-    slots = await _upcoming_slots()
-    if not slots:
-        await message.answer("В ближайшее время слотов по расписанию нет.")
-        return
-
-    kb = InlineKeyboardBuilder()
-    for date_iso, time_hm, group, taken in slots[:20]:
-        label = (
-            f"{scheduling.format_date_label(date_iso)} {time_hm} · {group} — "
-            f"{taken}/{config.CAPACITY_PER_SLOT}"
-        )
-        if move_booking_id:
-            kb.button(text=label, callback_data=f"mvto:{move_booking_id}:{_slot_key(date_iso, time_hm)}")
-        else:
-            kb.button(text=label, callback_data=f"slot:{_slot_key(date_iso, time_hm)}")
-    kb.adjust(1)
-
-    title = (
-        "Куда перенести запись? Выберите слот:"
-        if move_booking_id
-        else "Выберите слот, чтобы посмотреть, кто записан:"
-    )
-    await message.answer(title, reply_markup=kb.as_markup())
-
-
-async def render_slot_roster(message: Message, date_iso: str, time_hm: str, edit: bool = False) -> None:
-    roster = await db.get_slot_roster(date_iso, time_hm)
-    header = f"{scheduling.format_date_label(date_iso)} {time_hm} — {len(roster)}/{config.CAPACITY_PER_SLOT}"
-
-    if not roster:
-        text = f"{header}\n\nПока никто не записан."
-        kb = InlineKeyboardBuilder()
-        kb.button(text="⬅️ К списку слотов", callback_data="manage_root")
-    else:
-        text = f"{header}\n\nНажмите на человека, чтобы удалить или перенести его запись:"
-        kb = InlineKeyboardBuilder()
-        for r in roster:
-            mark = "⏳ " if r["booking_status"] == "pending" else ""
-            name = r["full_name"] or r["contact"] or "без имени"
-            kb.button(
-                text=f"{mark}{name} · {r['level'] or '—'}",
-                callback_data=f"bk:{r['booking_id']}",
-            )
-        kb.adjust(1)
-        kb.row(InlineKeyboardButton(text="⬅️ К списку слотов", callback_data="manage_root"))
-
-    if edit:
-        await message.edit_text(text, reply_markup=kb.as_markup())
-    else:
-        await message.answer(text, reply_markup=kb.as_markup())
-
-
-@router.message(Command("manage"))
-async def cmd_manage(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    await render_slots_menu(message)
-
-
-@router.callback_query(F.data == "manage_root")
-async def manage_root(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    await callback.message.delete()
-    await render_slots_menu(callback.message)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("slot:"))
-async def open_slot(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    date_iso, time_hm = callback.data.split(":", 1)[1].split("|")
-    await render_slot_roster(callback.message, date_iso, time_hm, edit=True)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("bk:"))
-async def open_booking(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    booking_id = int(callback.data.split(":", 1)[1])
-    b = await db.get_booking(booking_id)
-    if not b:
-        await callback.answer("Записи больше нет", show_alert=True)
-        return
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🗑 Удалить запись", callback_data=f"bkdel:{booking_id}")
-    kb.button(text="🔀 Перенести в другой слот", callback_data=f"bkmove:{booking_id}")
-    kb.button(text="⬅️ Назад к слоту", callback_data=f"slot:{_slot_key(b['date'], b['time'])}")
-    kb.adjust(1)
-
-    status = "⏳ ждём голосовое" if b["booking_status"] == "pending" else "✅ подтверждена"
-    await callback.message.edit_text(
-        f"<b>{b['full_name'] or '—'}</b>\n"
-        f"Уровень: {b['level'] or '—'}\n"
-        f"Слот: {_fmt_dt(b['date'], b['time'])}\n"
-        f"Статус записи: {status}\n"
-        f"Telegram: {b['contact'] or '@' + (b['username'] or '—')}",
-        reply_markup=kb.as_markup(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("bkdel:"))
-async def delete_booking_confirm(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    booking_id = int(callback.data.split(":", 1)[1])
-    b = await db.get_booking(booking_id)
-    if not b:
-        await callback.answer("Записи больше нет", show_alert=True)
-        return
-
-    await db.delete_booking(booking_id)
-    await callback.answer("Запись удалена")
-    await callback.message.edit_text(
-        f"🗑 Удалила запись: {b['full_name'] or '—'} — {_fmt_dt(b['date'], b['time'])}.\n"
-        f"Место в группе освободилось."
-    )
-    await render_slot_roster(callback.message, b["date"], b["time"])
-
-
-@router.callback_query(F.data.startswith("bkmove:"))
-async def move_booking_choose(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    booking_id = int(callback.data.split(":", 1)[1])
-    await callback.message.delete()
-    await render_slots_menu(callback.message, move_booking_id=booking_id)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("mvto:"))
-async def move_booking_apply(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    _, booking_id_raw, slot_key = callback.data.split(":", 2)
-    booking_id = int(booking_id_raw)
-    date_iso, time_hm = slot_key.split("|")
-
-    b = await db.get_booking(booking_id)
-    if not b:
-        await callback.answer("Записи больше нет", show_alert=True)
-        return
-
-    taken = await db.count_booked(date_iso, time_hm)
-    if taken >= config.CAPACITY_PER_SLOT:
-        await callback.answer("В этом слоте нет свободных мест", show_alert=True)
-        return
-
-    await db.move_booking(booking_id, date_iso, time_hm)
-    await callback.answer("Перенесла")
-    await callback.message.edit_text(
-        f"🔀 Перенесла: {b['full_name'] or '—'}\n"
-        f"было — {_fmt_dt(b['date'], b['time'])}\n"
-        f"стало — {_fmt_dt(date_iso, time_hm)}"
-    )
-
-    # Предупреждаем ученицу о переносе
-    try:
-        await callback.bot.send_message(
-            b["telegram_id"],
-            f"Ваш пробный урок перенесён на {_fmt_dt(date_iso, time_hm)}. "
-            f"Если это время не подходит — напишите мне здесь, подберём другое.",
-        )
-    except Exception:
-        log.exception("Не удалось уведомить о переносе %s", b["telegram_id"])
-
-    await render_slot_roster(callback.message, date_iso, time_hm)
-
-
-# ------------------------------------------------------- очистка данных ----
-# /cancelme — удалить свои записи (после тестов)
-# /resetdata — полностью очистить все записи, заявки и лист ожидания
-
-@router.message(Command("cancelme"))
-async def cmd_cancelme(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    removed = await db.delete_bookings_of(message.from_user.id)
-    if removed:
-        await message.answer(f"Удалила ваши записи: {removed} шт. Места в группах освободились.")
-    else:
-        await message.answer("У вас нет записей — удалять нечего.")
-
-
-@router.message(Command("resetdata"))
-async def cmd_resetdata(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🗑 Да, удалить всё", callback_data="confirm_reset")
-    kb.button(text="Отмена", callback_data="cancel_reset")
-    kb.adjust(1)
-    await message.answer(
-        "Удалить ВСЕ записи, заявки и лист ожидания?\n\n"
-        "Это нужно, чтобы очистить тестовые данные перед запуском. "
-        "Отредактированные тексты (/texts) и расписание сохранятся.",
-        reply_markup=kb.as_markup(),
-    )
-
-
-@router.callback_query(F.data == "cancel_reset")
-async def cancel_reset(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    await callback.message.edit_text("Отменила, данные на месте.")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "confirm_reset")
-async def confirm_reset(callback: CallbackQuery) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    stats = await db.wipe_all_data()
-    await callback.message.edit_text(
-        "Готово, всё очищено ✅\n"
-        f"Записей удалено: {stats['bookings']}\n"
-        f"Карточек учениц: {stats['clients']}\n"
-        f"Заявок в листе ожидания: {stats['waitlist']}"
-    )
-    await callback.answer()
-
-
-# --------------------------------------------------- редактирование текстов --
-# /texts — самостоятельная правка всех сообщений бота прямо в Telegram, без кода.
-
-@router.message(Command("texts"))
-async def cmd_texts(message: Message) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-
-    overrides = await db.get_all_text_overrides()
-    kb = InlineKeyboardBuilder()
-    for key, meta in texts.TEXT_DEFS.items():
-        mark = "✏️ " if key in overrides else ""
-        kb.button(text=f"{mark}{meta['label']}", callback_data=f"edittext:{key}")
-    kb.adjust(1)
-
-    await message.answer(
-        "Тексты бота — нажмите, чтобы посмотреть и изменить. ✏️ — уже отредактированный вами:",
-        reply_markup=kb.as_markup(),
-    )
-
-
-@router.callback_query(F.data.startswith("edittext:"))
-async def edittext_open(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    key = callback.data.split(":", 1)[1]
-    if key not in texts.TEXT_DEFS:
-        await callback.answer()
-        return
-
-    meta = texts.TEXT_DEFS[key]
-    current = await texts.get_text(key)
-
-    await state.set_state(EditingText.waiting_new_text)
-    await state.update_data(text_key=key)
-
-    hint = ""
-    if meta["vars"]:
-        placeholders = ", ".join(f"{{{v}}}" for v in meta["vars"])
-        hint = f"\n\n⚠️ В тексте есть переменные — оставьте их как есть: {placeholders}"
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="♻️ Сбросить на стандартный текст", callback_data=f"resettext:{key}")
-
-    await callback.message.answer(
-        f"<b>{meta['label']}</b>\n\nТекущий текст:\n\n{current}{hint}\n\n"
-        f"Чтобы изменить — пришлите новый текст следующим сообщением. Жирный/курсив можно "
-        f"поставить прямо в Telegram: выделите текст в поле ввода и нажмите на панели "
-        f"форматирования — бот сохранит форматирование как есть.",
-        reply_markup=kb.as_markup(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("resettext:"))
-async def edittext_reset(callback: CallbackQuery, state: FSMContext) -> None:
-    if not _is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-
-    key = callback.data.split(":", 1)[1]
-    await db.delete_text_override(key)
-    await state.clear()
-    default = texts.TEXT_DEFS.get(key, {}).get("default", "")
-    await callback.answer("Возвращён стандартный текст", show_alert=True)
-    await callback.message.answer(f"Готово, текст сброшен на стандартный:\n\n{default}")
-
-
-@router.message(EditingText.waiting_new_text, F.text)
-async def edittext_save(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-
-    data = await state.get_data()
-    key = data.get("text_key")
-    if not key:
-        await state.clear()
-        return
-
-    new_value = message.html_text  # сохраняет форматирование, применённое в Telegram
-    await db.set_text_override(key, new_value)
-    await state.clear()
-    await message.answer("Готово, текст обновлён! ✅ Можно проверить, пройдя /start ещё раз.")
-
-
-# ------------------------------------------------------ фоновая проверка ---
-
-async def check_stalled_clients(bot: Bot) -> None:
-    # last_activity хранится в UTC ISO, поэтому порог считаем тоже в UTC
-    threshold_utc = (
-        datetime.now(timezone.utc) - timedelta(minutes=config.STALL_TIMEOUT_MINUTES)
+async def send_reminders(bot: Bot) -> None:
+    """За день и за час до урока — оба раза со ссылкой."""
+    now = scheduling.now_local()
+    link = await db.get_setting(config.SETTING_LESSON_LINK) or "(ссылка не задана)"
+
+    for b in await db.get_confirmed_from(now.date().isoformat()):
+        starts_at = scheduling.slot_dt(b["date"], b["time"])
+        left = starts_at - now
+        when = scheduling.format_when(b["date"], b["time"])
+
+        if not b["reminder_day_sent"] and timedelta(hours=12) < left <= timedelta(hours=26):
+            try:
+                await bot.send_message(
+                    b["telegram_id"],
+                    await texts.get_text("reminder_day", when=when, link=link),
+                    disable_web_page_preview=True,
+                )
+                await db.mark_reminder(b["id"], "reminder_day_sent")
+            except Exception:
+                log.exception("Напоминание за день не ушло: %s", b["telegram_id"])
+
+        if not b["reminder_hour_sent"] and timedelta(0) < left <= timedelta(hours=1, minutes=10):
+            try:
+                await bot.send_message(
+                    b["telegram_id"],
+                    await texts.get_text("reminder_hour", when=when, link=link),
+                    disable_web_page_preview=True,
+                )
+                await db.mark_reminder(b["id"], "reminder_hour_sent")
+            except Exception:
+                log.exception("Напоминание за час не ушло: %s", b["telegram_id"])
+
+
+async def release_stale_holds(bot: Bot) -> None:
+    """Слот, который держится под голосовое дольше HOLD_MINUTES, освобождаем."""
+    threshold = (
+        datetime.now(timezone.utc) - timedelta(minutes=config.HOLD_MINUTES)
     ).isoformat()
-
-    stalled = await db.get_stalled_clients(STALLED_STATUSES, threshold_utc)
-    for client in stalled:
+    for b in await db.get_stale_held(threshold):
+        await db.set_booking_status(b["id"], "cancelled")
+        await db.update_client(b["telegram_id"], status="hold_expired")
         try:
-            text = await texts.get_text("stall_check_in")
-            await bot.send_message(client["telegram_id"], text, reply_markup=stall_reasons_kb())
-            await db.update_client(client["telegram_id"], stall_prompted=1)
+            await bot.send_message(b["telegram_id"], await texts.get_text("hold_expired"))
         except Exception:
-            log.exception("Не удалось написать клиенту %s", client["telegram_id"])
+            log.exception("Не удалось сообщить об освобождении слота: %s", b["telegram_id"])
 
-    # Одно напоминание тем, кто выбрал время, но не прислал голосовое
-    awaiting = await db.get_clients_awaiting_voice(threshold_utc)
-    for client in awaiting:
-        try:
-            text = await texts.get_text("voice_reminder")
-            await bot.send_message(client["telegram_id"], text)
-            await db.update_client(client["telegram_id"], stall_prompted=1)
-        except Exception:
-            log.exception("Не удалось напомнить о голосовом %s", client["telegram_id"])
 
-    # Освобождаем места, которые держались под голосовое слишком долго
-    hold_threshold = (
-        datetime.now(timezone.utc) - timedelta(minutes=config.PENDING_HOLD_MINUTES)
+async def nudge_silent(bot: Bot) -> None:
+    """Одно мягкое напоминание тем, кто выбрал время, но молчит."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=config.VOICE_NUDGE_MINUTES)
     ).isoformat()
-    for released in await db.release_stale_pending(hold_threshold):
+    for b in await db.get_stale_held(cutoff):
+        client = await db.get_client(b["telegram_id"])
+        if not client or client["status"] == "voice_nudged":
+            continue
         try:
-            await db.update_client(
-                released["telegram_id"], status="voice_expired", voice_status="", stall_prompted=1
-            )
-            await bot.send_message(
-                released["telegram_id"],
-                "Место на пробный урок пришлось освободить — голосовое так и не пришло 🙁\n"
-                "Если всё ещё хотите записаться, нажмите /start и выберите время заново.",
-            )
+            await bot.send_message(b["telegram_id"], await texts.get_text("voice_reminder"))
+            await db.update_client(b["telegram_id"], status="voice_nudged")
         except Exception:
-            log.exception("Не удалось уведомить об освобождении места %s", released["telegram_id"])
+            log.exception("Напоминание о голосовом не ушло: %s", b["telegram_id"])
 
 
 async def main() -> None:
@@ -903,11 +107,17 @@ async def main() -> None:
     await db.init_db()
 
     bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
+    storage = MemoryStorage()
+    dp = Dispatcher(storage=storage)
+
+    admin.set_storage(storage)
+    dp.include_router(admin.router)     # админка первой — её команды приоритетнее
+    dp.include_router(student.router)
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_stalled_clients, "interval", minutes=5, args=[bot])
+    scheduler.add_job(send_reminders, "interval", minutes=5, args=[bot])
+    scheduler.add_job(release_stale_holds, "interval", minutes=10, args=[bot])
+    scheduler.add_job(nudge_silent, "interval", minutes=5, args=[bot])
     scheduler.start()
 
     log.info("Бот запущен")
