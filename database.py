@@ -411,6 +411,35 @@ async def get_confirmed_from(date_iso: str) -> list[dict]:
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def get_all_bookings_full() -> list[dict]:
+    """Все записи со всеми данными ученицы — для выгрузки в Google Таблицу."""
+    async with _db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT b.id, b.date, b.time, b.level, b.status, b.created_at, b.confirmed_at,
+                      c.telegram_id, c.username, c.full_name,
+                      c.claimed_level, c.confirmed_level
+               FROM bookings b JOIN clients c ON c.id = b.client_id
+               ORDER BY b.date DESC, b.time DESC"""
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_clients_without_booking() -> list[dict]:
+    """Те, кто заходил в бота, но так и не записался — тоже полезно видеть."""
+    async with _db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT c.* FROM clients c
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM bookings b
+                   WHERE b.client_id = c.id AND b.status != 'cancelled'
+               )
+               ORDER BY c.last_activity DESC"""
+        )
+        return [dict(r) for r in await cur.fetchall()]
+
+
 async def get_stale_held(older_than_iso: str) -> list[dict]:
     """Слоты, которые держатся под голосовое слишком долго."""
     async with _db() as db:
