@@ -266,6 +266,11 @@ async def no_time_fits(callback: CallbackQuery, state: FSMContext) -> None:
 
 # ------------------------------------------------- отправка подтверждения --
 
+async def lesson_link_for(level: str) -> str:
+    """Ссылка на урок этого уровня — задаётся в /admin."""
+    return await db.get_setting(config.link_key(level)) or "(ссылка ещё не задана)"
+
+
 async def send_confirmation(bot, telegram_id: int, booking_id: int) -> None:
     """Ссылка + материалы уровня. Вызывается после решения преподавателя."""
     booking = await db.get_booking(booking_id)
@@ -273,7 +278,7 @@ async def send_confirmation(bot, telegram_id: int, booking_id: int) -> None:
         return
 
     level = booking["level"]
-    link = await db.get_setting(config.SETTING_LESSON_LINK) or "(ссылка ещё не задана)"
+    link = await lesson_link_for(level)
     materials = await db.get_setting(config.materials_key(level))
 
     text = await texts.get_text(

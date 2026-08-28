@@ -40,12 +40,12 @@ log = logging.getLogger("trial_lesson_bot")
 async def send_reminders(bot: Bot) -> None:
     """За день и за час до урока — оба раза со ссылкой."""
     now = scheduling.now_local()
-    link = await db.get_setting(config.SETTING_LESSON_LINK) or "(ссылка не задана)"
 
     for b in await db.get_confirmed_from(now.date().isoformat()):
         starts_at = scheduling.slot_dt(b["date"], b["time"])
         left = starts_at - now
         when = scheduling.format_when(b["date"], b["time"])
+        link = await student.lesson_link_for(b["level"])
 
         if not b["reminder_day_sent"] and timedelta(hours=12) < left <= timedelta(hours=26):
             try:

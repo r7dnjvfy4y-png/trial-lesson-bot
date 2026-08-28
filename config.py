@@ -49,8 +49,12 @@ VOICE_NUDGE_MINUTES = int(os.getenv("VOICE_NUDGE_MINUTES", "20"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# Ключи настроек, которые редактируются через /admin
-SETTING_LESSON_LINK = "lesson_link"
+# Ключи настроек, которые редактируются через /admin:
+# у каждого уровня своя ссылка на урок и свои материалы.
+
+
+def link_key(level: str) -> str:
+    return f"lesson_link_{level}"
 
 
 def materials_key(level: str) -> str:

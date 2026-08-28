@@ -453,7 +453,7 @@ async def delete_booking(callback: CallbackQuery) -> None:
 # --------------------------------------------- ссылка и материалы ----------
 
 SETTING_LABELS = {
-    config.SETTING_LESSON_LINK: "🔗 Ссылка на урок (одна для всех)",
+    **{config.link_key(lvl): f"🔗 Ссылка на урок {lvl}" for lvl in config.LEVELS},
     **{config.materials_key(lvl): f"📚 Материалы {lvl}" for lvl in config.LEVELS},
 }
 
@@ -469,7 +469,7 @@ async def settings_menu(callback: CallbackQuery, state: FSMContext) -> None:
     kb.adjust(1)
     kb.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="a:root"))
     await callback.message.edit_text(
-        "Ссылка на урок и материалы по уровням. ✅ — уже заполнено:",
+        "Ссылки на уроки и материалы — по каждому уровню своя. ✅ — уже заполнено:",
         reply_markup=kb.as_markup(),
     )
     await callback.answer()
