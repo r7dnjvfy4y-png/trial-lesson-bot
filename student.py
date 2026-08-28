@@ -15,7 +15,7 @@ import config
 import database as db
 import scheduling
 import texts
-from keyboards import levels_kb, materials_kb, slots_kb
+from keyboards import levels_kb, slots_kb
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -44,7 +44,8 @@ def review_kb(booking_id: int):
     kb.button(text="✅ Всё верно", callback_data=f"rvok:{booking_id}")
     for lvl in config.LEVELS:
         kb.button(text=f"Изменить на {lvl}", callback_data=f"rvlvl:{booking_id}:{lvl}")
-    kb.adjust(1, len(config.LEVELS))
+    # Каждая кнопка на своей строке — иначе на телефоне они обрезаются
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -205,7 +206,7 @@ async def got_voice(message: Message, state: FSMContext) -> None:
                     "🎧 Заявка на пробный — послушайте голосовое выше\n\n"
                     f"Имя: {booking['full_name']}\n"
                     f"Заявленный уровень: {booking['claimed_level']}\n"
-                    f"Выбранное время: {scheduling.format_when(booking['date'], booking['time'])}\n"
+                    f"Выбранное время: {scheduling.format_when_admin(booking['date'], booking['time'])}\n"
                     f"Telegram: @{booking['username'] or '—'}"
                 ),
                 reply_markup=review_kb(booking["id"]),
@@ -271,6 +272,14 @@ async def lesson_link_for(level: str) -> str:
     return await db.get_setting(config.link_key(level)) or "(ссылка ещё не задана)"
 
 
+def as_link(url: str, label: str) -> str:
+    """Ссылка, вшитая в слово: в Telegram видно синее слово, длинный адрес
+    не показывается. Если ссылки нет — возвращаем текст как есть."""
+    if url and url.startswith("http"):
+        return f'<a href="{url}">{label}</a>'
+    return url or label
+
+
 async def send_confirmation(bot, telegram_id: int, booking_id: int) -> None:
     """Ссылка + материалы уровня. Вызывается после решения преподавателя."""
     booking = await db.get_booking(booking_id)
@@ -284,12 +293,26 @@ async def send_confirmation(bot, telegram_id: int, booking_id: int) -> None:
     text = await texts.get_text(
         texts.confirmed_key(level),
         when=scheduling.format_when(booking["date"], booking["time"]),
-        link=link,
-        materials=materials or "пришлю отдельно",
+        # {link} и {materials} — короткие синие слова со вшитой ссылкой,
+        # {link_url} и {materials_url} — если где-то нужен полный адрес
+        link=as_link(link, "zoom"),
+        materials=as_link(materials, "материалы") if materials else "пришлю отдельно",
+        link_url=link,
+        materials_url=materials or "пришлю отдельно",
     )
-    kb = materials_kb(materials) if materials.startswith("http") else None
+    # Подтверждение уходит без кнопок: ссылки уже вшиты в текст
+    photo = await db.get_setting(config.photo_key(level))
+
     try:
-        await bot.send_message(telegram_id, text, reply_markup=kb, disable_web_page_preview=True)
+        if photo and len(text) <= 1024:
+            # Фото с текстом одним сообщением
+            await bot.send_photo(telegram_id, photo, caption=text)
+        elif photo:
+            # Текст длиннее подписи к фото — шлём фото, следом текст
+            await bot.send_photo(telegram_id, photo)
+            await bot.send_message(telegram_id, text, disable_web_page_preview=True)
+        else:
+            await bot.send_message(telegram_id, text, disable_web_page_preview=True)
     except Exception:
         log.exception("Не удалось отправить подтверждение %s", telegram_id)
 

@@ -4,7 +4,7 @@ schedule_rules) — вручную ничего создавать не нужн
 слоты берутся из slot_blocks.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta  # noqa: F401 — datetime используется и в sheets.py
 from zoneinfo import ZoneInfo
 
 import config
@@ -38,6 +38,13 @@ def format_date(date_iso: str) -> str:
 
 
 def format_when(date_iso: str, time_hm: str) -> str:
+    """Для сообщений ученицам: «30.08 в 10:00»."""
+    d = datetime.strptime(date_iso, "%Y-%m-%d").date()
+    return f"{d.day:02d}.{d.month:02d} в {time_hm}"
+
+
+def format_when_admin(date_iso: str, time_hm: str) -> str:
+    """Для админки: с днём недели — «Вс, 30 авг в 10:00»."""
     d = datetime.strptime(date_iso, "%Y-%m-%d").date()
     return f"{WEEKDAY_RU[d.weekday()]}, {d.day} {MONTH_RU[d.month]} в {time_hm}"
 

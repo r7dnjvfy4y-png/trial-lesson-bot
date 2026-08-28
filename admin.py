@@ -18,6 +18,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 import config
 import database as db
 import scheduling
+import sheets
 import student
 import texts
 
@@ -63,6 +64,7 @@ def main_menu_kb():
     kb.button(text="🗓 Расписание и слоты", callback_data="a:slots")
     kb.button(text="🔗 Ссылка и материалы", callback_data="a:settings")
     kb.button(text="✏️ Тексты бота", callback_data="a:texts")
+    kb.button(text="📊 Google Таблица", callback_data="a:sheet")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -131,7 +133,7 @@ async def open_review(callback: CallbackQuery) -> None:
     await callback.message.answer(
         f"<b>{b['full_name']}</b>\n"
         f"Заявленный уровень: {b['claimed_level']}\n"
-        f"Время: {scheduling.format_when(b['date'], b['time'])}\n"
+        f"Время: {scheduling.format_when_admin(b['date'], b['time'])}\n"
         f"Telegram: @{b['username'] or '—'}",
         reply_markup=student.review_kb(booking_id),
     )
@@ -152,7 +154,7 @@ async def review_confirm(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(
         f"✅ Подтверждено: {b['full_name']} · {b['level']} · "
-        f"{scheduling.format_when(b['date'], b['time'])}\n"
+        f"{scheduling.format_when_admin(b['date'], b['time'])}\n"
         f"Ученице отправлены ссылка и материалы."
     )
     await callback.answer("Подтверждено")
@@ -192,7 +194,7 @@ async def review_change_level(callback: CallbackQuery) -> None:
 
     await callback.message.edit_text(
         f"🔀 Уровень изменён на {level}: {b['full_name']}\n"
-        f"Слот {scheduling.format_when(b['date'], b['time'])} освобождён, "
+        f"Слот {scheduling.format_when_admin(b['date'], b['time'])} освобождён, "
         f"ученице отправлены слоты уровня {level}."
     )
     await callback.answer("Уровень изменён")
@@ -212,7 +214,7 @@ async def list_confirmed(callback: CallbackQuery) -> None:
     lines = [f"Подтверждённые записи: {len(rows)}", ""]
     current = None
     for b in rows:
-        head = f"{scheduling.format_when(b['date'], b['time'])} · {b['level']}"
+        head = f"{scheduling.format_when_admin(b['date'], b['time'])} · {b['level']}"
         if head != current:
             current = head
             lines.append(f"\n<b>{head}</b>")
@@ -388,7 +390,7 @@ async def open_slot(callback: CallbackQuery) -> None:
     ) or "Пока никто не записан."
 
     await callback.message.edit_text(
-        f"<b>{scheduling.format_when(date_iso, time_hm)} · {level}</b>\n"
+        f"<b>{scheduling.format_when_admin(date_iso, time_hm)} · {level}</b>\n"
         f"Занято {len(roster)}/{capacity}\n\n{body}\n\n"
         f"Нажмите на человека, чтобы удалить его запись.",
         reply_markup=kb.as_markup(),
@@ -402,7 +404,7 @@ async def block_slot(callback: CallbackQuery) -> None:
     await db.block_slot(date_iso, time_hm, level)
     await callback.answer("Слот отменён")
     await callback.message.edit_text(
-        f"🚫 Слот {scheduling.format_when(date_iso, time_hm)} · {level} отменён — "
+        f"🚫 Слот {scheduling.format_when_admin(date_iso, time_hm)} · {level} отменён — "
         f"в этот раз его не будет. Правило расписания при этом осталось.",
         reply_markup=back_kb("a:upcoming"),
     )
@@ -426,7 +428,7 @@ async def open_booking(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
         f"<b>{b['full_name']}</b>\n"
         f"Уровень: {b['level']}\n"
-        f"Время: {scheduling.format_when(b['date'], b['time'])}\n"
+        f"Время: {scheduling.format_when_admin(b['date'], b['time'])}\n"
         f"Статус: {STATUS_RU.get(b['status'], b['status'])}\n"
         f"Telegram: @{b['username'] or '—'}",
         reply_markup=kb.as_markup(),
@@ -445,7 +447,7 @@ async def delete_booking(callback: CallbackQuery) -> None:
     await callback.answer("Запись удалена")
     await callback.message.edit_text(
         f"🗑 Удалила запись: {b['full_name']} — "
-        f"{scheduling.format_when(b['date'], b['time'])}. Место освободилось.",
+        f"{scheduling.format_when_admin(b['date'], b['time'])}. Место освободилось.",
         reply_markup=back_kb("a:upcoming"),
     )
 
@@ -455,7 +457,11 @@ async def delete_booking(callback: CallbackQuery) -> None:
 SETTING_LABELS = {
     **{config.link_key(lvl): f"🔗 Ссылка на урок {lvl}" for lvl in config.LEVELS},
     **{config.materials_key(lvl): f"📚 Материалы {lvl}" for lvl in config.LEVELS},
+    **{config.photo_key(lvl): f"🖼 Фото к подтверждению {lvl}" for lvl in config.LEVELS},
 }
+
+# Настройки, для которых нужно прислать не текст, а картинку
+PHOTO_SETTINGS = {config.photo_key(lvl) for lvl in config.LEVELS}
 
 
 @router.callback_query(F.data == "a:settings")
@@ -481,19 +487,62 @@ async def setting_open(callback: CallbackQuery, state: FSMContext) -> None:
     value = await db.get_setting(key)
     await state.set_state(AdminFlow.setting_value)
     await state.update_data(setting_key=key)
-    await callback.message.edit_text(
-        f"<b>{SETTING_LABELS.get(key, key)}</b>\n\n"
-        f"Сейчас: {value or '— не задано —'}\n\n"
-        f"Пришлите новое значение сообщением (обычно это ссылка).",
-        disable_web_page_preview=True,
-    )
+
+    if key in PHOTO_SETTINGS:
+        # Сначала показываем текущее фото, если оно уже загружено
+        if value:
+            try:
+                await callback.message.answer_photo(value, caption="Сейчас стоит это фото")
+            except Exception:
+                log.exception("Не удалось показать текущее фото")
+        await callback.message.answer(
+            f"<b>{SETTING_LABELS.get(key, key)}</b>\n\n"
+            f"Пришлите фото — оно будет приходить ученице вместе с подтверждением.\n\n"
+            f"Чтобы убрать фото, отправьте слово: <code>удалить</code>"
+        )
+    else:
+        await callback.message.edit_text(
+            f"<b>{SETTING_LABELS.get(key, key)}</b>\n\n"
+            f"Сейчас: {value or '— не задано —'}\n\n"
+            f"Пришлите новое значение сообщением (обычно это ссылка).",
+            disable_web_page_preview=True,
+        )
     await callback.answer()
+
+
+@router.message(AdminFlow.setting_value, F.photo)
+async def setting_save_photo(message: Message, state: FSMContext) -> None:
+    """Фото сохраняем по его file_id — файл остаётся на серверах Telegram."""
+    data = await state.get_data()
+    key = data.get("setting_key")
+    if key not in PHOTO_SETTINGS:
+        await message.answer("Для этого пункта нужно прислать текст, а не фото.")
+        return
+
+    await db.set_setting(key, message.photo[-1].file_id)
+    await state.clear()
+    await message.answer(
+        "Фото сохранено ✅ Теперь оно будет приходить вместе с подтверждением.",
+        reply_markup=main_menu_kb(),
+    )
 
 
 @router.message(AdminFlow.setting_value, F.text)
 async def setting_save(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await db.set_setting(data["setting_key"], message.text.strip())
+    key = data["setting_key"]
+    value = message.text.strip()
+
+    if key in PHOTO_SETTINGS:
+        if value.lower() in ("удалить", "убрать", "-"):
+            await db.set_setting(key, "")
+            await state.clear()
+            await message.answer("Фото убрано ✅", reply_markup=main_menu_kb())
+        else:
+            await message.answer("Пришлите, пожалуйста, именно фото (или слово «удалить»).")
+        return
+
+    await db.set_setting(key, value)
     await state.clear()
     await message.answer("Сохранила ✅", reply_markup=main_menu_kb())
 
@@ -566,6 +615,54 @@ async def text_save(message: Message, state: FSMContext) -> None:
     await db.set_text_override(data["text_key"], message.html_text)
     await state.clear()
     await message.answer("Текст обновлён ✅", reply_markup=main_menu_kb())
+
+
+# -------------------------------------------------------- Google Таблица ---
+
+@router.callback_query(F.data == "a:sheet")
+async def sheet_menu(callback: CallbackQuery) -> None:
+    if not (config.GOOGLE_SHEET_ID and config.GOOGLE_CREDENTIALS_JSON):
+        await callback.message.edit_text(
+            "Выгрузка в Google Таблицу пока не подключена.\n\n"
+            "Нужно один раз добавить на Railway две переменные: GOOGLE_SHEET_ID и "
+            "GOOGLE_CREDENTIALS_JSON — как это сделать, описано в README, раздел "
+            "«Google Таблица».",
+            reply_markup=back_kb(),
+        )
+        await callback.answer()
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔄 Обновить сейчас", callback_data="sheet_sync")
+    kb.button(text="⬅️ Назад", callback_data="a:root")
+    kb.adjust(1)
+    await callback.message.edit_text(
+        f"Таблица обновляется сама каждые {config.SHEET_SYNC_MINUTES} мин.\n\n"
+        f"Листы: «Заявки», «Слоты», «Без записи».\n"
+        f"https://docs.google.com/spreadsheets/d/{config.GOOGLE_SHEET_ID}/edit",
+        reply_markup=kb.as_markup(),
+        disable_web_page_preview=True,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "sheet_sync")
+async def sheet_sync(callback: CallbackQuery) -> None:
+    await callback.answer("Обновляю…")
+    try:
+        url = await sheets.sync()
+        await callback.message.edit_text(
+            f"Таблица обновлена ✅\n{url}",
+            reply_markup=back_kb(),
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        await callback.message.edit_text(
+            f"Не получилось обновить таблицу:\n\n{exc}\n\n"
+            f"Чаще всего причина — таблица не расшарена на сервисный аккаунт "
+            f"или неверный GOOGLE_SHEET_ID.",
+            reply_markup=back_kb(),
+        )
 
 
 # ------------------------------------------------------ сервисные команды --

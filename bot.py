@@ -30,6 +30,7 @@ import admin
 import config
 import database as db
 import scheduling
+import sheets
 import student
 import texts
 
@@ -45,13 +46,14 @@ async def send_reminders(bot: Bot) -> None:
         starts_at = scheduling.slot_dt(b["date"], b["time"])
         left = starts_at - now
         when = scheduling.format_when(b["date"], b["time"])
-        link = await student.lesson_link_for(b["level"])
+        link_url = await student.lesson_link_for(b["level"])
+        link = student.as_link(link_url, "zoom")
 
         if not b["reminder_day_sent"] and timedelta(hours=12) < left <= timedelta(hours=26):
             try:
                 await bot.send_message(
                     b["telegram_id"],
-                    await texts.get_text("reminder_day", when=when, link=link),
+                    await texts.get_text("reminder_day", when=when, link=link, link_url=link_url),
                     disable_web_page_preview=True,
                 )
                 await db.mark_reminder(b["id"], "reminder_day_sent")
@@ -62,7 +64,7 @@ async def send_reminders(bot: Bot) -> None:
             try:
                 await bot.send_message(
                     b["telegram_id"],
-                    await texts.get_text("reminder_hour", when=when, link=link),
+                    await texts.get_text("reminder_hour", when=when, link=link, link_url=link_url),
                     disable_web_page_preview=True,
                 )
                 await db.mark_reminder(b["id"], "reminder_hour_sent")
@@ -118,6 +120,9 @@ async def main() -> None:
     scheduler.add_job(send_reminders, "interval", minutes=5, args=[bot])
     scheduler.add_job(release_stale_holds, "interval", minutes=10, args=[bot])
     scheduler.add_job(nudge_silent, "interval", minutes=5, args=[bot])
+    if config.GOOGLE_SHEET_ID and config.GOOGLE_CREDENTIALS_JSON:
+        scheduler.add_job(sheets.safe_sync, "interval", minutes=config.SHEET_SYNC_MINUTES)
+        log.info("Выгрузка в Google Таблицу включена, интервал %s мин", config.SHEET_SYNC_MINUTES)
     scheduler.start()
 
     log.info("Бот запущен")

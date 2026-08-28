@@ -49,6 +49,15 @@ VOICE_NUDGE_MINUTES = int(os.getenv("VOICE_NUDGE_MINUTES", "20"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
+# --------------------------------------------------------- Google Таблица --
+# ID таблицы (кусок ссылки между /d/ и /edit) и JSON-ключ сервисного аккаунта
+# одной строкой. Если не заданы — бот просто работает без выгрузки.
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON", "")
+
+# Как часто обновлять таблицу, в минутах
+SHEET_SYNC_MINUTES = int(os.getenv("SHEET_SYNC_MINUTES", "5"))
+
 # Ключи настроек, которые редактируются через /admin:
 # у каждого уровня своя ссылка на урок и свои материалы.
 
@@ -59,3 +68,8 @@ def link_key(level: str) -> str:
 
 def materials_key(level: str) -> str:
     return f"materials_{level}"
+
+
+def photo_key(level: str) -> str:
+    """Фото, которое бот прикладывает к подтверждению записи этого уровня."""
+    return f"photo_{level}"
